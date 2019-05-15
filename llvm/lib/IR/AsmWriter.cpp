@@ -89,6 +89,12 @@
 
 using namespace llvm;
 
+// facebook begin T44360418
+cl::opt<bool> PrintForDev("print-for-dev", cl::ReallyHidden, cl::init(false),
+                          cl::ZeroOrMore,
+                          cl::desc("Developer friendly IR printing"));
+// facebook end
+
 // Make virtual table appear in this compilation unit.
 AssemblyAnnotationWriter::~AssemblyAnnotationWriter() = default;
 
@@ -2574,6 +2580,12 @@ class AssemblyWriter {
   SetVector<const Comdat *> Comdats;
   bool IsForDebug;
   bool ShouldPreserveUseListOrder;
+  // facebook begin T44360418
+  bool IsForDev;
+  static const int LHSEndColumn = 15;
+  static const int RHSStartColumn = 17;
+  static const int LocationColumn = 80;
+  // facebook end
   UseListOrderMap UseListOrders;
   SmallVector<StringRef, 8> MDNames;
   /// Synchronization scope names registered with LLVMContext.
@@ -2584,10 +2596,12 @@ public:
   /// Construct an AssemblyWriter with an external SlotTracker
   AssemblyWriter(formatted_raw_ostream &o, SlotTracker &Mac, const Module *M,
                  AssemblyAnnotationWriter *AAW, bool IsForDebug,
-                 bool ShouldPreserveUseListOrder = false);
+                 bool ShouldPreserveUseListOrder = false,
+                 bool IsForDev = false);
 
   AssemblyWriter(formatted_raw_ostream &o, SlotTracker &Mac,
-                 const ModuleSummaryIndex *Index, bool IsForDebug);
+                 const ModuleSummaryIndex *Index, bool IsForDebug,
+                 bool IsForDev = false);
 
   AsmWriterContext getContext() {
     return AsmWriterContext(&TypePrinter, &Machine, TheModule);
@@ -2672,10 +2686,12 @@ private:
 
 AssemblyWriter::AssemblyWriter(formatted_raw_ostream &o, SlotTracker &Mac,
                                const Module *M, AssemblyAnnotationWriter *AAW,
-                               bool IsForDebug, bool ShouldPreserveUseListOrder)
+                               bool IsForDebug, bool ShouldPreserveUseListOrder,
+                               bool IsForDev)
     : Out(o), TheModule(M), Machine(Mac), TypePrinter(M), AnnotationWriter(AAW),
       IsForDebug(IsForDebug),
-      ShouldPreserveUseListOrder(ShouldPreserveUseListOrder) {
+      ShouldPreserveUseListOrder(ShouldPreserveUseListOrder),
+      IsForDev(IsForDev) {
   if (!TheModule)
     return;
   for (const GlobalObject &GO : TheModule->global_objects())
@@ -2684,9 +2700,11 @@ AssemblyWriter::AssemblyWriter(formatted_raw_ostream &o, SlotTracker &Mac,
 }
 
 AssemblyWriter::AssemblyWriter(formatted_raw_ostream &o, SlotTracker &Mac,
-                               const ModuleSummaryIndex *Index, bool IsForDebug)
+                               const ModuleSummaryIndex *Index, bool IsForDebug,
+                               bool IsForDev)
     : Out(o), TheIndex(Index), Machine(Mac), TypePrinter(/*Module=*/nullptr),
-      IsForDebug(IsForDebug), ShouldPreserveUseListOrder(false) {}
+      IsForDebug(IsForDebug), ShouldPreserveUseListOrder(false),
+      IsForDev(IsForDev) {}
 
 void AssemblyWriter::writeOperand(const Value *Operand, bool PrintType) {
   if (!Operand) {
@@ -2880,10 +2898,12 @@ void AssemblyWriter::printModule(const Module *M) {
   // Output global use-lists.
   printUseLists(nullptr);
 
-  // Output all attribute groups.
-  if (!Machine.as_empty()) {
-    Out << '\n';
-    writeAllAttributeGroups();
+  if (!IsForDev) { // facebook T44360418
+    // Output all attribute groups.
+    if (!Machine.as_empty()) {
+      Out << '\n';
+      writeAllAttributeGroups();
+    }
   }
 
   // Output named metadata.
@@ -2897,7 +2917,7 @@ void AssemblyWriter::printModule(const Module *M) {
     Out << '\n';
     writeAllMDNodes();
   }
-}
+  }
 
 void AssemblyWriter::printModuleSummaryIndex() {
   assert(TheIndex);
@@ -4007,6 +4027,11 @@ void AssemblyWriter::printBasicBlock(const BasicBlock *BB) {
 
 /// printInstructionLine - Print an instruction and a newline character.
 void AssemblyWriter::printInstructionLine(const Instruction &I) {
+  // facebook begin T44360418
+  if (IsForDev && isa<DbgInfoIntrinsic>(I))
+    return;
+  // facebook end
+
   printInstruction(I);
   Out << '\n';
 }
@@ -4069,15 +4094,26 @@ void AssemblyWriter::printInstruction(const Instruction &I) {
   // Print out name if it exists...
   if (I.hasName()) {
     PrintLLVMName(Out, &I);
-    Out << " = ";
   } else if (!I.getType()->isVoidTy()) {
     // Print out the def slot taken.
     int SlotNum = Machine.getLocalSlot(&I);
     if (SlotNum == -1)
-      Out << "<badref> = ";
+      Out << "<badref>";
     else
-      Out << '%' << SlotNum << " = ";
+      Out << '%' << SlotNum;
   }
+
+  // facebook begin T44360418
+  bool EqualSign = (I.hasName() || !I.getType()->isVoidTy());
+  if (IsForDev) {
+    if (EqualSign) {
+      Out.PadToColumn(LHSEndColumn);
+      Out << "= ";
+    } else
+      Out.PadToColumn(RHSStartColumn);
+  } else if (EqualSign)
+    Out << " = ";
+  // facebook end
 
   if (const CallInst *CI = dyn_cast<CallInst>(&I)) {
     if (CI->isMustTailCall())
@@ -4486,6 +4522,16 @@ void AssemblyWriter::printInstruction(const Instruction &I) {
     PrintShuffleMask(Out, SVI->getType(), SVI->getShuffleMask());
   }
 
+  // facebook begin T44360418
+  if (IsForDev) {
+    if (DebugLoc DL = I.getDebugLoc()) {
+      Out.PadToColumn(LocationColumn);
+      DL.printConcise(Out);
+    }
+    return;
+  }
+  // facebook end
+
   // Print Metadata info.
   SmallVector<std::pair<unsigned, MDNode *>, 4> InstMD;
   I.getAllMetadata(InstMD);
@@ -4651,9 +4697,9 @@ void Function::print(raw_ostream &ROS, AssemblyAnnotationWriter *AAW,
                      bool IsForDebug) const {
   SlotTracker SlotTable(this->getParent());
   formatted_raw_ostream OS(ROS);
-  AssemblyWriter W(OS, SlotTable, this->getParent(), AAW,
-                   IsForDebug,
-                   ShouldPreserveUseListOrder);
+  AssemblyWriter W(OS, SlotTable, this->getParent(), AAW, IsForDebug,
+                   ShouldPreserveUseListOrder,
+                   PrintForDev);         // facebook T44360418
   W.printFunction(this);
 }
 
@@ -4678,7 +4724,8 @@ void Module::print(raw_ostream &ROS, AssemblyAnnotationWriter *AAW,
   SlotTracker SlotTable(this);
   formatted_raw_ostream OS(ROS);
   AssemblyWriter W(OS, SlotTable, this, AAW, IsForDebug,
-                   ShouldPreserveUseListOrder);
+                   ShouldPreserveUseListOrder,
+                   PrintForDev);         // facebook T44360418
   W.printModule(this);
 
   if (ConvertAfter)
@@ -4830,14 +4877,17 @@ void Value::print(raw_ostream &ROS, ModuleSlotTracker &MST,
 
   if (const Instruction *I = dyn_cast<Instruction>(this)) {
     incorporateFunction(I->getParent() ? I->getParent()->getParent() : nullptr);
-    AssemblyWriter W(OS, SlotTable, getModuleFromVal(I), nullptr, IsForDebug);
+    AssemblyWriter W(OS, SlotTable, getModuleFromVal(I), nullptr, IsForDebug,
+                     PrintForDev);
     W.printInstruction(*I);
   } else if (const BasicBlock *BB = dyn_cast<BasicBlock>(this)) {
     incorporateFunction(BB->getParent());
-    AssemblyWriter W(OS, SlotTable, getModuleFromVal(BB), nullptr, IsForDebug);
+    AssemblyWriter W(OS, SlotTable, getModuleFromVal(BB), nullptr, IsForDebug,
+                     PrintForDev);
     W.printBasicBlock(BB);
   } else if (const GlobalValue *GV = dyn_cast<GlobalValue>(this)) {
-    AssemblyWriter W(OS, SlotTable, GV->getParent(), nullptr, IsForDebug);
+    AssemblyWriter W(OS, SlotTable, GV->getParent(), nullptr, IsForDebug,
+                     PrintForDev);
     if (const GlobalVariable *V = dyn_cast<GlobalVariable>(GV))
       W.printGlobal(V);
     else if (const Function *F = dyn_cast<Function>(GV))

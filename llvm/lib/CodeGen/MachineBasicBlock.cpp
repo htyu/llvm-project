@@ -48,6 +48,8 @@ static cl::opt<bool> PrintSlotIndexes(
              "SlotIndexes when available"),
     cl::init(true), cl::Hidden);
 
+extern cl::opt<bool> PrintForDev; // facebook T44360418
+
 MachineBasicBlock::MachineBasicBlock(MachineFunction &MF, const BasicBlock *B)
     : BB(B), Number(-1), xParent(&MF) {
   Insts.Parent = this;
